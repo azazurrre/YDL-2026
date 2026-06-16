@@ -3,11 +3,11 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Super Mini Mario — 10 Levels</title>
+<title>Aidahar — 10 Levels</title>
 <style>
   html, body {
     margin: 0;
-    height: 100%;
+    min-height: 100%;
     background: #5c94fc;
     display: flex;
     flex-direction: column;
@@ -15,29 +15,70 @@
     justify-content: center;
     font-family: monospace, sans-serif;
     color: #fff;
+    padding: 12px 0;
+    box-sizing: border-box;
   }
-  h1 { margin: 6px; letter-spacing: 2px; text-shadow: 2px 2px #000; font-size: 22px; }
+  h1 { margin: 6px; letter-spacing: 4px; text-shadow: 2px 2px #000; font-size: 24px; }
   #info { margin-bottom: 8px; font-size: 12px; opacity: .9; text-align: center; line-height: 1.5; }
   canvas {
     background: #5c94fc;
     border: 4px solid #000;
     image-rendering: pixelated;
   }
+  #levels {
+    margin-top: 12px; display: flex; flex-wrap: wrap; gap: 6px;
+    align-items: center; justify-content: center; max-width: 808px;
+  }
+  #levels .lbl { font-size: 12px; opacity: .9; margin-right: 4px; }
+  #levels button {
+    font-family: monospace; font-size: 13px; font-weight: bold;
+    color: #fff; background: #2a4a8c; border: 2px solid #11244d;
+    border-radius: 5px; padding: 5px 9px; cursor: pointer; min-width: 30px;
+  }
+  #levels button:hover { background: #3a63b8; }
+  #levels button.active { background: #ffb020; color: #3a2410; border-color: #b97c10; }
+  #levelName { font-size: 13px; width: 100%; text-align: center; opacity: .95; margin-top: 6px; }
 </style>
 </head>
 <body>
-  <h1>SUPER MINI MARIO — 10 LEVELS</h1>
+  <h1>AIDAHAR</h1>
   <div id="info">
     ← → move &nbsp;|&nbsp; ↑ / Space = jump (press again in air to <b>double jump</b>) &nbsp;|&nbsp; R restart<br>
-    Bonk <b>?</b> boxes from below for coins / size / speed / a monster. Stomp brown monsters once,
-    <b>green armored ones twice</b>. Dodge <b>spikes</b> &amp; <b>saws</b>. Reach the castle.
+    Bonk <b>?</b> boxes from below for coins / size / speed / a dragon. Stomp dragons once,
+    <b>glowing armored ones twice</b>. Dodge <b>spikes</b> &amp; <b>saws</b>. Reach the castle.
   </div>
   <canvas id="game" width="800" height="400"></canvas>
+  <div id="levels"><span class="lbl">Jump to level:</span></div>
+  <div id="levelName"></div>
 
 <script>
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 const W = canvas.width, H = canvas.height;
+
+// ---- Sprite images (each faces RIGHT by default; flipped when moving left) ----
+// SRC = tight content box inside each 1086x1448 PNG (transparent padding cropped out).
+const IMG = {};
+const SRC = {
+  player:  { sx: 219, sy: 158, sw: 592, sh: 909 },
+  monster: { sx: 89,  sy: 279, sw: 819, sh: 904 },
+  castle:  { sx: 99,  sy: 391, sw: 893, sh: 798 },
+};
+function loadImg(key, src) { const im = new Image(); im.onload = () => { IMG[key] = im; }; im.src = src; }
+loadImg('player', 'player.png');
+loadImg('monster', 'monster.png');
+loadImg('castle', 'castle.png');
+
+// Draw a cropped sprite anchored at bottom-center, optionally mirrored to face left.
+function drawSprite(key, cx, bottom, dh, flip) {
+  const im = IMG[key], s = SRC[key];
+  const dw = dh * (s.sw / s.sh);
+  ctx.save();
+  ctx.translate(cx, bottom);
+  if (flip) ctx.scale(-1, 1);
+  ctx.drawImage(im, s.sx, s.sy, s.sw, s.sh, -dw / 2, -dh, dw, dh);
+  ctx.restore();
+}
 
 // ---- Physics constants ----
 const GRAVITY   = 0.6;
@@ -259,13 +300,37 @@ function loadLevel(n) {
   endCastle = { x: d.endX, doorCx: d.endX + 48, door: { x: d.endX + 33, y: groundY - 46, w: 30, h: 46 } };
 
   player = {
-    x: START_CASTLE_X + 110, y: groundY - 32, w: 26, h: 32,
+    x: START_CASTLE_X + 130, y: groundY - 32, w: 26, h: 32,
     vx: 0, vy: 0, onGround: false, face: 1,
     jumps: 0, big: false, speedMul: 1, iframes: 0, alpha: 1,
   };
   camX = 0;
   state = 'start';
   banner = 'LEVEL ' + (n + 1) + ' — ' + d.name;
+  updateLevelButtons();
+}
+
+// ---- Level-select menu under the game frame ----
+const levelsEl = document.getElementById('levels');
+const levelNameEl = document.getElementById('levelName');
+function buildLevelMenu() {
+  LEVEL_DATA.forEach((d, i) => {
+    const b = document.createElement('button');
+    b.textContent = (i + 1);
+    b.title = d.name;
+    b.addEventListener('click', () => { goToLevel(i); b.blur(); });
+    levelsEl.appendChild(b);
+  });
+}
+function updateLevelButtons() {
+  if (!levelsEl) return;
+  levelsEl.querySelectorAll('button').forEach((b, i) => b.classList.toggle('active', i === level));
+  if (levelNameEl) levelNameEl.textContent = 'Level ' + (level + 1) + ' — ' + LEVEL_DATA[level].name;
+}
+function goToLevel(n) {
+  loadLevel(n);
+  state = 'play';        // jump straight into the chosen level
+  SFX.castleOut();
 }
 
 function startGame() { score = 0; lives = 3; loadLevel(0); }
@@ -608,6 +673,23 @@ function drawSign(s) {
 }
 
 function drawEnemy(e) {
+  if (!IMG.monster) { drawEnemyVector(e); return; }
+  const S = SRC.monster;
+  const dh = e.h * (e.type === 'tough' ? 1.55 : 1.35);
+  const dw = dh * (S.sw / S.sh);
+  const cx = e.x + e.w / 2, vy = e.y + e.h - dh * 0.5;
+  // tough dragons get a glowing aura so they're easy to tell apart (gold normally, red once wounded)
+  if (e.type === 'tough') {
+    ctx.save(); ctx.globalAlpha = 0.45;
+    ctx.fillStyle = e.hurt ? '#ff4d4d' : '#ffd24d';
+    ctx.beginPath(); ctx.ellipse(cx, vy, dw * 0.6, dh * 0.5, 0, 0, 7); ctx.fill();
+    ctx.restore();
+  }
+  // source faces right → mirror when moving left (dir === -1)
+  drawSprite('monster', cx, e.y + e.h, dh, e.dir === -1);
+}
+
+function drawEnemyVector(e) {
   if (e.type === 'tough') {
     // armored shell creature — green, distinct from brown goomba
     const body = e.hurt ? '#e07a2a' : '#2bb673';
@@ -634,6 +716,23 @@ function drawEnemy(e) {
 }
 
 function drawCastle(x, withFlag) {
+  if (IMG.castle) {
+    const S = SRC.castle;
+    const CH = 116, CW = CH * (S.sw / S.sh);
+    const cx = x + 48;                       // keep aligned with the door trigger (doorCx = x + 48)
+    ctx.drawImage(IMG.castle, S.sx, S.sy, S.sw, S.sh, cx - CW / 2, groundY - CH, CW, CH);
+    if (withFlag) {                          // mark the goal castle with a flag
+      const fx = cx, ftop = groundY - CH - 30;
+      ctx.fillStyle = '#fff'; ctx.fillRect(fx - 1, ftop, 3, 32);
+      ctx.fillStyle = '#e53935';
+      ctx.beginPath(); ctx.moveTo(fx + 2, ftop); ctx.lineTo(fx + 30, ftop + 9); ctx.lineTo(fx + 2, ftop + 18); ctx.fill();
+    }
+    return;
+  }
+  drawCastleVector(x, withFlag);
+}
+
+function drawCastleVector(x, withFlag) {
   const top = groundY - 104, w = 96, h = 104;
   ctx.fillStyle = '#b9b9c4'; ctx.fillRect(x, top, w, h);
   ctx.fillStyle = '#9a9aa6';
@@ -655,6 +754,16 @@ function drawPlayer() {
   if (!player) return;
   if (player.iframes > 0 && (player.iframes >> 2) % 2 === 0) return;
   ctx.globalAlpha = player.alpha;
+  if (IMG.player) {
+    // source faces right → mirror when facing left (face === -1)
+    drawSprite('player', player.x + player.w / 2, player.y + player.h, player.h * 1.2, player.face === -1);
+  } else {
+    drawPlayerVector();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawPlayerVector() {
   const px = player.x, py = player.y, w = player.w, h = player.h;
   const hat = Math.max(8, h * 0.28), face = h * 0.22;
   ctx.fillStyle = '#e53935'; ctx.fillRect(px, py, w, hat);
@@ -663,7 +772,6 @@ function drawPlayer() {
   ctx.fillStyle = '#000';
   const eyeX = player.face === 1 ? px + w - 9 : px + 5;
   ctx.fillRect(eyeX, py + hat + 3, 3, 3);
-  ctx.globalAlpha = 1;
 }
 
 function drawHUD() {
@@ -700,6 +808,7 @@ function drawOverlay() {
 
 function loop() { update(); draw(); requestAnimationFrame(loop); }
 
+buildLevelMenu();
 startGame();
 loop();
 </script>
