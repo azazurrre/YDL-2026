@@ -1,0 +1,11 @@
+# секреты — НЕ коммитить
+.env
+.streamlit/secrets.toml
+
+# скачанные PDF и прочие файлы (тяжёлые, собираются scrape.py)
+data/files/
+
+# служебное
+__pycache__/
+*.pyc
+.DS_Store
