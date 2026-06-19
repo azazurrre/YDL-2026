@@ -10,6 +10,8 @@
 Запуск:  streamlit run app.py
 """
 
+import hashlib
+import json
 import os
 import re
 import time
@@ -31,11 +33,19 @@ EMB_DIM = 1024
 # Сколько ближайших chunk-ов класть в промпт и порог отсечения.
 # Если максимальное косинусное сходство ниже порога — считаем, что в данных
 # нет релевантной информации, и НЕ зовём gemma4 (честно отвечаем «не знаю»).
-# Порог 0.45 подобран на реальных embeddings text-1024: релевантные вопросы
-# давали сходство 0.55–0.85, посторонние — 0.15–0.39. 0.45 лежит в разрыве.
-# ВРЕМЕННО отключён (0) для проверки — вернуть на 0.45 после отладки.
+# Порог низкий (0.30) намеренно: это лишь дешёвый предохранитель против
+# заведомо посторонних вопросов (где звать gemma бессмысленно). Основной
+# отказ «в данных нет» обеспечивает системный промпт — он надёжно работает
+# даже на пограничных вопросах. Калибровка на реальных embeddings text-1024
+# (чанки 500 симв. + маскирование по программе): валидные вопросы с ответом
+# дают 0.75–0.87, посторонние/без-ответа — около 0.35 и ниже. 0.30 лежит ниже
+# разрыва, поэтому не режет валидные ответы, а спорное отдаёт на суд gemma.
 TOP_K = 8
-SIM_THRESHOLD = 0.0
+SIM_THRESHOLD = 0.30
+
+# Показывать ли debug-панель с найденными чанками. Перед показом
+# пользователям / деплоем поставить False.
+DEBUG = True
 
 # Ключи НЕ хранятся в коде (чтобы не попасть в git). Берём из переменной
 # окружения или из .streamlit/secrets.toml.
@@ -52,7 +62,23 @@ def _get_key(name):
 LLM_KEY = _get_key("GEMMA_KEY")
 EMB_KEY = _get_key("EMB_KEY")
 
+# --- настройки отправки email (MailerSend) ---
+# Письма шлём ТОЛЬКО на свой собственный ADMIN_EMAIL и ТОЛЬКО по кнопке —
+# никогда в цикле. Иначе один баг разошлёт пачку писем и испортит репутацию
+# домена-отправителя у Gmail (вся почта домена начнёт уходить в спам).
+MAILERSEND_KEY = _get_key("MAILERSEND_KEY")
+ADMIN_EMAIL = _get_key("ADMIN_EMAIL")
+# Отправитель ДОЛЖЕН быть на домене, верифицированном в твоём аккаунте
+# MailerSend (иначе отправка падает). По умолчанию — домен курса; если у тебя
+# свой trial-домен (вида test-xxxx.mlsender.net), задай FROM_EMAIL в secrets.
+FROM_EMAIL = _get_key("FROM_EMAIL") or "info@app.commit.kz"
+FROM_NAME = "Yessenov Data Lab"
+
 DATA_DIR = Path(__file__).parent / "data"
+# Куда складываем посчитанные embeddings, чтобы не пересчитывать при каждом
+# перезапуске. Кэш привязан к содержимому data/*.txt и параметрам нарезки —
+# меняются данные или нарезка => индекс считается заново.
+CACHE_DIR = Path(__file__).parent / ".cache"
 
 # Системная инструкция — здесь и заложена защита от выдумывания.
 SYSTEM_PROMPT = """Ты — ассистент Научно-образовательного фонда им. Шахмардана Есенова.
@@ -144,11 +170,32 @@ def split_into_chunks(text, max_chars=500, overlap_lines=2):
     return chunks
 
 
+def _index_signature(texts):
+    """Отпечаток корпуса: содержимое всех файлов + модель + параметры нарезки.
+
+    Если поменялись данные, embedding-модель или дефолты split_into_chunks —
+    отпечаток меняется, и дисковый кэш считается невалидным (пересчёт).
+    """
+    h = hashlib.sha256()
+    chunk_params = repr(split_into_chunks.__defaults__)  # (max_chars, overlap)
+    h.update(f"v1|{EMB_MODEL}|{EMB_DIM}|{chunk_params}".encode("utf-8"))
+    for t in texts:
+        h.update(t.encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()[:16]
+
+
 @st.cache_resource(show_spinner="Строю индекс (считаю embeddings)…")
 def build_index():
     """Прочитать data/*.txt, нарезать на chunks, посчитать embeddings.
 
-    Считается ОДИН раз (cache_resource). Возвращает:
+    Двухуровневый кэш:
+      1. @st.cache_resource — держит готовый индекс в памяти на время сессии.
+      2. .cache/index_<отпечаток>.npy — сохраняет матрицу embeddings на диск,
+         поэтому при перезапуске процесса она грузится мгновенно, без запросов
+         к embedding-API. Пересчёт только если изменились данные/нарезка/модель.
+
+    Возвращает:
       chunks  — список dict {text, source}
       matrix  — нормированная матрица embeddings [N, EMB_DIM]
       names   — список имён программ
@@ -156,16 +203,27 @@ def build_index():
     files = sorted(DATA_DIR.glob("*.txt"))
     chunks = []
     names = []
+    texts = []
     for f in files:
         text = f.read_text(encoding="utf-8").strip()
         if not text:
             continue
         names.append(f.stem)
+        texts.append(text)
         for piece in split_into_chunks(text):
             chunks.append({"text": piece, "source": f.stem})
 
+    # nарезка детерминирована, поэтому достаточно кэшировать только матрицу:
+    # chunks восстанавливаются из тех же текстов в том же порядке.
+    sig = _index_signature(texts)
+    cache_file = CACHE_DIR / f"index_{sig}.npy"
+    if cache_file.exists():
+        matrix = np.load(cache_file)
+        if matrix.shape == (len(chunks), EMB_DIM):  # защита от рассинхрона
+            return chunks, matrix, names
+
     # embeddings всех chunk-ов (лёгкий троттлинг, чтобы не словить rate limit
-    # на первой сборке индекса — потом всё кэшируется и больше не считается)
+    # на первой сборке индекса — потом кэшируется на диск и больше не считается)
     vectors = np.zeros((len(chunks), EMB_DIM), dtype=np.float32)
     for i, ch in enumerate(chunks):
         vectors[i] = embed(ch["text"])
@@ -175,6 +233,12 @@ def build_index():
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     matrix = vectors / norms
+
+    # сохраняем на диск; старые отпечатки чистим, чтобы кэш не разрастался
+    CACHE_DIR.mkdir(exist_ok=True)
+    for old in CACHE_DIR.glob("index_*.npy"):
+        old.unlink()
+    np.save(cache_file, matrix)
     return chunks, matrix, names
 
 
@@ -279,6 +343,112 @@ def ask_gemma(knowledge, history, question, program_names=None):
     return resp.json()["choices"][0]["message"]["content"]
 
 
+def summarize_dialog(history):
+    """Короткое саммари диалога через gemma4 — для письма администратору."""
+    transcript = "\n".join(
+        f"{'Пользователь' if m['role'] == 'user' else 'Бот'}: {m['content']}"
+        for m in history
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Сделай короткое саммари диалога пользователя с чат-ботом фонда "
+                "Есенова для администратора фонда. Укажи: какие программы/гранты "
+                "интересовали, какой главный запрос, оставил ли пользователь "
+                "заявку или контакт. 3–6 предложений, по-русски, по делу, без воды."
+            ),
+        },
+        {"role": "user", "content": transcript},
+    ]
+    payload = {"model": LLM_MODEL, "messages": messages, "temperature": 0.2}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LLM_KEY}",
+    }
+    resp = requests.post(LLM_URL, json=payload, headers=headers, timeout=120)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+def send_summary_email(summary):
+    """Отправить саммари ТОЛЬКО на ADMIN_EMAIL (себе) через MailerSend.
+
+    Вызывается строго по кнопке (явное действие пользователя), не в цикле.
+    Возвращает message_id при успехе.
+    """
+    from mailersend import MailerSendClient, EmailBuilder
+
+    ms = MailerSendClient(api_key=MAILERSEND_KEY)
+    html = "<h2>Саммари разговора (чат-бот фонда Есенова)</h2>" + "".join(
+        f"<p>{line}</p>" for line in summary.splitlines() if line.strip()
+    )
+    email = (
+        EmailBuilder()
+        .from_email(FROM_EMAIL, FROM_NAME)
+        .to_many([{"email": ADMIN_EMAIL, "name": "Admin"}])
+        .subject("Новая заявка/диалог из чата фонда")
+        .html(html)
+        .text(summary)
+        .build()
+    )
+    response = ms.emails.send(email)
+    # MailerSend возвращает id письма в заголовке x-message-id (в теле его нет)
+    headers = getattr(response, "headers", None) or {}
+    return headers.get("x-message-id") or headers.get("X-Message-Id")
+
+
+def detect_application(history):
+    """Решение МОДЕЛИ: оставил ли пользователь заявку/запрос для администратора.
+
+    Возвращает (notify: bool, summary: str). Это «осознанное решение модели»
+    из задания — отдельный строгий вызов, который классифицирует диалог и,
+    если это заявка/запрос/оставленный контакт, готовит саммари.
+
+    Fail-safe: при любой неоднозначности или ошибке парсинга -> notify=False.
+    Лучше НЕ отправить, чем разослать лишнее и испортить репутацию домена.
+    """
+    transcript = "\n".join(
+        f"{'Пользователь' if m['role'] == 'user' else 'Бот'}: {m['content']}"
+        for m in history
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Ты — фильтр уведомлений администратора фонда Есенова. Определи, "
+                "оставил ли ПОЛЬЗОВАТЕЛЬ в диалоге ЗАЯВКУ или конкретный ЗАПРОС, "
+                "о котором стоит уведомить администратора. notify=true ТОЛЬКО "
+                "если пользователь: хочет подать заявку на программу, просит "
+                "связаться с ним, оставил контакт (email/телефон), просит "
+                "записать/зарегистрировать его. Обычные информационные вопросы "
+                "(что такое программа, дедлайн, документы) -> notify=false.\n"
+                "Ответь СТРОГО одним JSON-объектом без пояснений и без markdown:\n"
+                '{"notify": true|false, "summary": "<2-4 предложения для '
+                'администратора: кто, что хочет, оставленные контакты>"}'
+            ),
+        },
+        {"role": "user", "content": transcript},
+    ]
+    payload = {"model": LLM_MODEL, "messages": messages, "temperature": 0}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LLM_KEY}",
+    }
+    try:
+        resp = requests.post(LLM_URL, json=payload, headers=headers, timeout=120)
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"].strip()
+        # снимаем возможные ```json … ``` обёртки
+        content = re.sub(r"^```(?:json)?|```$", "", content, flags=re.MULTILINE).strip()
+        # берём первый JSON-объект из ответа
+        match = re.search(r"\{.*\}", content, flags=re.DOTALL)
+        data = json.loads(match.group(0) if match else content)
+        return bool(data.get("notify")), str(data.get("summary", "")).strip()
+    except Exception:
+        return False, ""
+
+
 # ----------------- интерфейс -----------------
 st.set_page_config(page_title="Чат-бот фонда Есенова", page_icon="🎓")
 st.title("🎓 Чат-бот фонда Ш. Есенова")
@@ -301,14 +471,58 @@ if not LLM_KEY or not EMB_KEY:
 
 chunks, matrix, program_names = build_index()
 
+if "history" not in st.session_state:
+    st.session_state.history = []
+# флаг «уже уведомили администратора в этой сессии» — предохранитель от
+# повторных писем (правило «никогда в цикле»)
+if "notified" not in st.session_state:
+    st.session_state.notified = False
+
 with st.sidebar:
     st.subheader("Загруженные программы")
     for name in program_names:
         st.write(f"• {name}")
     st.caption(f"Индекс: {len(chunks)} фрагментов, top-{TOP_K}, порог {SIM_THRESHOLD}")
 
-if "history" not in st.session_state:
-    st.session_state.history = []
+    # --- Отправка саммари администратору (шаг «чат -> агент») ---
+    st.divider()
+    st.subheader("📧 Администратору")
+    if not (MAILERSEND_KEY and ADMIN_EMAIL):
+        st.caption(
+            "Отправка выключена: задайте MAILERSEND_KEY и ADMIN_EMAIL "
+            "в .streamlit/secrets.toml."
+        )
+    else:
+        st.caption(f"Саммари разговора уйдёт на {ADMIN_EMAIL} (только вам).")
+        # Авто-режим: модель сама решает, заявка ли это, и шлёт письмо.
+        # Можно выключить для демо ручной кнопки.
+        st.checkbox(
+            "Авто-отправка при заявке/запросе",
+            value=True,
+            key="auto_notify",
+            help="Бот сам отправит саммари, если решит, что вы оставили заявку. "
+            "Не чаще одного письма за сессию.",
+        )
+        if st.session_state.notified:
+            st.caption("✓ Администратор уже уведомлён в этой сессии.")
+        # Кнопка = явное действие. Срабатывает один раз на клик, не в цикле.
+        if st.button(
+            "Отправить саммари вручную",
+            disabled=not st.session_state.history,
+            use_container_width=True,
+        ):
+            with st.spinner("Готовлю саммари и отправляю…"):
+                try:
+                    summary = summarize_dialog(st.session_state.history)
+                    msg_id = send_summary_email(summary)
+                    st.session_state.notified = True
+                    st.success(f"Отправлено на {ADMIN_EMAIL}.")
+                    if msg_id:
+                        st.caption(f"message_id: {msg_id}")
+                    with st.expander("Что отправили"):
+                        st.write(summary)
+                except Exception as e:
+                    st.error(f"Не удалось отправить: {e}")
 
 # показать историю
 for msg in st.session_state.history:
@@ -334,16 +548,18 @@ if question:
                 )
 
                 # DEBUG: показать найденные чанки и их similarity-баллы
-                focus_label = focus or "не определена (поиск по всем)"
-                with st.expander(
-                    f"🔍 debug: программа={focus_label} · "
-                    f"найденные чанки (max_sim={max_sim:.3f})"
-                ):
-                    for rank, c in enumerate(found, 1):
-                        st.markdown(
-                            f"**#{rank} · score={c['score']:.3f} · источник: {c['source']}**"
-                        )
-                        st.text(c["text"])
+                if DEBUG:
+                    focus_label = focus or "не определена (поиск по всем)"
+                    with st.expander(
+                        f"🔍 debug: программа={focus_label} · "
+                        f"найденные чанки (max_sim={max_sim:.3f})"
+                    ):
+                        for rank, c in enumerate(found, 1):
+                            st.markdown(
+                                f"**#{rank} · score={c['score']:.3f} · "
+                                f"источник: {c['source']}**"
+                            )
+                            st.text(c["text"])
 
                 if max_sim < SIM_THRESHOLD:
                     # ничего достаточно похожего не нашлось — не зовём gemma4
@@ -371,3 +587,30 @@ if question:
         st.markdown(answer)
 
     st.session_state.history.append({"role": "assistant", "content": answer})
+
+    # --- Агентское действие: модель сама решает, заявка ли это, и шлёт письмо ---
+    # Предохранители (правило «никогда в цикле»):
+    #   • срабатывает только внутри обработки нового вопроса (не на каждом rerun);
+    #   • не чаще одного письма за сессию (флаг notified);
+    #   • при сомнении/ошибке detect_application возвращает notify=False.
+    if (
+        st.session_state.get("auto_notify")
+        and not st.session_state.notified
+        and MAILERSEND_KEY
+        and ADMIN_EMAIL
+    ):
+        try:
+            notify, summary = detect_application(st.session_state.history)
+            if notify and summary:
+                send_summary_email(summary)
+                st.session_state.notified = True
+                st.info(
+                    "📧 Похоже на заявку — отправил саммари администратору "
+                    f"({ADMIN_EMAIL})."
+                )
+                with st.expander("Что отправлено администратору"):
+                    st.write(summary)
+        except Exception as e:
+            # сбой почты не должен ломать чат; в debug показываем причину
+            if DEBUG:
+                st.warning(f"авто-уведомление не сработало: {e}")

@@ -9,3 +9,6 @@ data/files/
 __pycache__/
 *.pyc
 .DS_Store
+
+# кэш посчитанных embeddings (пересобирается из data/*.txt)
+.cache/
